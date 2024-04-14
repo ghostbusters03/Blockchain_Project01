@@ -3,8 +3,13 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"flag"
 	"fmt"
+	"io"
+	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +23,20 @@ type Block struct {
 }
 
 var Blockchain []Block
+var BootstrapNodeIP = "localhost" // Bootstrap node IP address
+var BootstrapNodePort = 9090      // Bootstrap node port
+
+// Add a global variable to track the bootstrap node
+var BootstrapNode = Node{IP: BootstrapNodeIP, Port: BootstrapNodePort}
+
+var mutex sync.Mutex
+
+type Node struct {
+	IP   string
+	Port int
+}
+
+var Nodes []Node
 
 func createBlock(transactions []string, prevHash string) Block {
 	merkleRoot, merkleTree := createMerkleRoot(transactions)
@@ -151,7 +170,222 @@ func displayMerkleTree(merkleTree [][]string) {
 	fmt.Println()
 }
 
+func registerNode(ip string, port int) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	// Check if the node already exists
+	for _, node := range Nodes {
+		if node.IP == ip && node.Port == port {
+			fmt.Printf("Node %s:%d already registered.\n", ip, port)
+			return
+		}
+	}
+	newNode := Node{IP: ip, Port: port}
+	Nodes = append(Nodes, newNode)
+	fmt.Printf("Node registered: IP: %s, Port: %d\n", ip, port)
+	// Add a log statement to check the nodes slice after adding the new node
+	fmt.Println("Updated Nodes:", Nodes)
+}
+
+// Add a function to send information about known nodes to another node
+func sendNodesInfo(conn net.Conn) {
+	// Create a string containing information about known nodes
+	nodeInfo := ""
+	for _, node := range Nodes {
+		nodeInfo += fmt.Sprintf("%s:%d\n", node.IP, node.Port)
+	}
+	// Send the information to the other node
+	conn.Write([]byte(nodeInfo))
+}
+
+// Modify the handleConnection function to handle messages from other nodes
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	// Read messages from the connection
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		if err != io.EOF {
+			fmt.Println("Error reading from connection:", err.Error())
+		}
+		return
+	}
+	message := string(buffer[:n])
+	// If the message is requesting node information, send the information
+	if message == "getNodesInfo" {
+		sendNodesInfo(conn)
+	}
+}
+
+func connectToBootstrapNode(port int) {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", BootstrapNode.IP, BootstrapNode.Port))
+	if err != nil {
+		fmt.Println("Error connecting to bootstrap node:", err.Error())
+		return
+	}
+	defer conn.Close()
+
+	// Register the node with the bootstrap node
+	registerNode("localhost", port)
+
+	// Request information about existing nodes
+	conn.Write([]byte("getNodesInfo"))
+
+	// Receive IP addresses/port numbers of existing nodes from the bootstrap node
+	existingNodes := receiveExistingNodes(conn)
+	// Connect to existing nodes
+	connectedNodes := make(map[string]bool) // Track connected nodes
+	for _, node := range existingNodes {
+		address := fmt.Sprintf("%s:%d", node.IP, node.Port)
+		if !connectedNodes[address] && (node.IP != "localhost" || node.Port != port) {
+			// Avoid connecting to itself and skip duplicate connections
+			connectToPeer(node)
+			connectedNodes[address] = true
+		}
+	}
+	// Add a log statement to check the list of existing nodes after receiving from bootstrap node
+	fmt.Println("Existing Nodes after connecting to bootstrap node:", existingNodes)
+}
+
+func receiveExistingNodes(conn net.Conn) []Node {
+	// Read peer addresses from the connection
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		if err != io.EOF {
+			fmt.Println("Error receiving existing nodes:", err.Error())
+		}
+		return nil
+	}
+	peerData := string(buffer[:n])
+
+	// Split the received data to extract individual peer addresses
+	existingNodesData := strings.Split(peerData, "\n")
+	var existingNodes []Node
+	for _, data := range existingNodesData {
+		parts := strings.Split(data, ":")
+		if len(parts) == 2 {
+			port, _ := strconv.Atoi(parts[1])
+			node := Node{IP: parts[0], Port: port}
+			existingNodes = append(existingNodes, node)
+		}
+	}
+	fmt.Println("Received existing nodes:", existingNodes)
+	return existingNodes
+}
+
+func connectToPeer(node Node) {
+	address := fmt.Sprintf("%s:%d", node.IP, node.Port)
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		fmt.Println("Error connecting to peer:", err.Error())
+		return
+	}
+	defer conn.Close()
+	fmt.Printf("Connected to peer: %s\n", address)
+	// Handle communication with the peer here
+}
+
+func displayNetwork() {
+	fmt.Println("P2P Network:")
+
+	for _, node := range Nodes {
+		fmt.Printf("Node IP: %s, Port: %d\n", node.IP, node.Port)
+	}
+}
+
+func startServer(port int, isBootstrap bool) {
+	// If it's the bootstrap node, register it
+	if isBootstrap {
+		registerNode("localhost", port)
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		fmt.Println("Error listening:", err.Error())
+		return
+	}
+	defer ln.Close()
+	fmt.Printf("Node listening on port %d\n", port)
+
+	// If it's the bootstrap node, just handle incoming connections
+	if isBootstrap {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				fmt.Println("Error accepting connection:", err.Error())
+				continue
+			}
+			// Handle incoming connections
+			go handleConnection(conn)
+		}
+	}
+
+	if !isBootstrap {
+		ticker := time.NewTicker(10 * time.Second) // Adjust the interval as needed
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// Periodically exchange information about known nodes with other nodes
+				for _, node := range Nodes {
+					go func(node Node) {
+						conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", node.IP, node.Port))
+						if err != nil {
+							fmt.Println("Error connecting to node:", err.Error())
+							return
+						}
+						defer conn.Close()
+						// Send a request for node information
+						conn.Write([]byte("getNodesInfo"))
+						// Receive information about known nodes from the other node
+						existingNodes := receiveExistingNodes(conn)
+						// Update the list of known nodes
+						mutex.Lock()
+						for _, newNode := range existingNodes {
+							Nodes = append(Nodes, newNode)
+						}
+						mutex.Unlock()
+					}(node)
+				}
+			default:
+				// Do nothing and continue the loop
+			}
+
+			// Accept incoming connections
+			conn, err := ln.Accept()
+			if err != nil {
+				fmt.Println("Error accepting connection:", err.Error())
+				continue
+			}
+			// Handle incoming connections
+			go handleConnection(conn)
+		}
+	}
+}
+func atoi(s string) int {
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		fmt.Println("Error converting string to int:", err.Error())
+	}
+	return i
+}
+
 func main() {
+	// Define command-line flag for the port number
+	var port int
+	flag.IntVar(&port, "port", 8081, "Port number for the node")
+	flag.Parse()
+
+	// Start the bootstrap node on a separate goroutine
+	go startServer(BootstrapNodePort, true)
+
+	// Connect to the bootstrap node
+	connectToBootstrapNode(port)
+
+	// Start the server on the specified port
+	go startServer(port, false)
+
 	// Initial transactions and mining
 	trans1 := AddVehicle("WDDGF7HB8DA832917", "Mercedes", "C63", 2013, "Murtaza Haider")
 	trans2 := TransferOwnership("WDDGF7HB8DA832917", "Murtaza Haider", "Abdullah Tariq")
@@ -167,6 +401,11 @@ func main() {
 	minedGenesisBlock := mineBlock(genesisBlock, 2)
 	Blockchain = append(Blockchain, minedGenesisBlock)
 
+	// Display P2P network
+	displayNetwork()
+
 	displayBlocks()
 	GenerateVehicleHistoryReport("WDDGF7HB8DA832917") // Generate and print history report for a specific VIN
+
+	select {}
 }
